@@ -34,6 +34,7 @@ variables:
   NEXUS_URL: "https://nexus.home.lan"
   NEXUS_BIN_REPORTS_REPO: "bin-reports"
   NEXUS_REPORT_UPLOAD: "true"
+  GIT_SSL_NO_VERIFY: "true"
 
 # Pull in all component hidden-job templates
 include:
