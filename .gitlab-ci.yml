@@ -1,0 +1,540 @@
+# ============================================================
+# Security Showcase Pipeline
+# ============================================================
+#
+# Full-stack security assessment of the National Bank of Greece
+# (intentionally vulnerable) Spring Boot banking application.
+#
+# Pulls in every component from homelab/components and exercises
+# them across five ordered stages:
+#
+#   build        — Clone banking-app, compile JAR with Maven
+#   threat-model — STRIDE, DREAD, Attack Tree, DFD analysis
+#   analyze      — RE: strings, crypto, entropy, imports,
+#                  symbols, packer, shellcode, network IOCs
+#   fuzz         — HTTP dir, input mutation, SQLi, XSS, auth,
+#                  REST API, protocol (app runs live in each job)
+#   report       — Master aggregator → one combined findings JSON
+#
+# All findings are in DefectDojo Generic Findings format and
+# uploaded to Nexus at: bin-reports/<project>/<sha>/<job>/
+# ============================================================
+
+stages:
+  - build
+  - threat-model
+  - analyze
+  - fuzz
+  - report
+
+variables:
+  BANKING_APP_REPO: "https://root:glpat-difF-6vbnCzEvMCbeck5O286MQp1OjEH.01.0w1eldbh9@gitlab.home.lan/homelab/development/banking-app.git"
+  BANKING_APP_JAR: "banking-app.jar"
+  FUZZ_TARGET_URL: "http://localhost:8080"
+  NEXUS_URL: "https://nexus.home.lan"
+  NEXUS_BIN_REPORTS_REPO: "bin-reports"
+  NEXUS_REPORT_UPLOAD: "true"
+
+# Pull in all component hidden-job templates
+include:
+  # Threat modeling
+  - project: homelab/components/threat-modeling
+    ref: main
+    file: stride.yml
+  - project: homelab/components/threat-modeling
+    ref: main
+    file: dread.yml
+  - project: homelab/components/threat-modeling
+    ref: main
+    file: attack-tree.yml
+  - project: homelab/components/threat-modeling
+    ref: main
+    file: dfd-threats.yml
+  - project: homelab/components/threat-modeling
+    ref: main
+    file: report.yml
+  # Reverse engineering
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-strings.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-crypto.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-entropy.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-imports.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-symbols.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-packer.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-shellcode.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-network.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-antidebug.yml
+  # Fuzzing
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-http.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-input.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-sqli.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-xss.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-auth.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-rest.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-protocol.yml
+  - project: homelab/components/fuzzing
+    ref: main
+    file: fuzz-report.yml
+
+# ─── .bootstrap: shared before_script that starts the banking app ────────────
+# Fuzz jobs extend this to get a live Spring Boot instance at localhost:8080.
+# Image must have Java; pip is installed here for Python fuzzing scripts.
+.start-banking-app:
+  image: eclipse-temurin:17-jdk-jammy
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-pip curl 2>/dev/null
+    - pip3 install --quiet requests 2>/dev/null
+    - echo "Starting banking-app..."
+    - java -jar "${BANKING_APP_JAR}" --server.port=8080 > app.log 2>&1 &
+    - |
+      for i in $(seq 1 30); do
+        curl -sf http://localhost:8080/actuator/health 2>/dev/null && echo "App ready (${i}s)" && break
+        curl -sf http://localhost:8080/login 2>/dev/null && echo "App ready at /login (${i}s)" && break
+        echo "Waiting for app... ${i}s"
+        sleep 2
+      done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1: BUILD
+# ─────────────────────────────────────────────────────────────────────────────
+
+build-banking-app:
+  stage: build
+  image: maven:3.9-eclipse-temurin-17
+  cache:
+    key: "maven-${CI_COMMIT_REF_SLUG}"
+    paths: [.m2/repository]
+  variables:
+    MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn"
+  script:
+    - echo "Cloning banking-app source..."
+    - git clone --depth=1 "${BANKING_APP_REPO}" banking-app-src
+    - cd banking-app-src
+    - mvn package -DskipTests -q
+    - JAR=$(find target -name "*.jar" ! -name "*original*" | head -1)
+    - cp "$JAR" "../${BANKING_APP_JAR}"
+    - echo "Built $(ls -lh ../${BANKING_APP_JAR})"
+  artifacts:
+    name: "banking-app-jar-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - banking-app.jar
+    expire_in: 1 day
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2: THREAT MODELING
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure static analysis — no binary or live app needed.
+
+tm-stride:
+  extends: .stride-analysis
+  stage: threat-model
+  variables:
+    TM_APP_NAME: "NBG Banking Application"
+    TM_DESCRIPTION: >
+      Spring Boot web banking app with H2 database. Users can log in, view
+      accounts, search profiles, and transfer funds. Exposes REST API and
+      Spring Actuator endpoints. Intentionally vulnerable.
+
+tm-dread:
+  extends: .dread-score
+  stage: threat-model
+
+tm-attack-tree:
+  extends: .attack-tree
+  stage: threat-model
+
+tm-dfd:
+  extends: .dfd-threats
+  stage: threat-model
+
+tm-report:
+  extends: .tm-report
+  stage: threat-model
+  needs:
+    - job: tm-stride
+      artifacts: true
+    - job: tm-dread
+      artifacts: true
+    - job: tm-attack-tree
+      artifacts: true
+    - job: tm-dfd
+      artifacts: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3: REVERSE ENGINEERING — JAR ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+# All RE jobs inherit the built JAR artifact and analyse it as a binary.
+# JARs are ZIP-format: string extraction, crypto constants, and entropy
+# analysis all work directly. Import/symbol analysis treats it as a blob.
+
+re-strings:
+  extends: .re-strings
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+    RE_MIN_STRING_LEN: "8"
+
+re-crypto:
+  extends: .re-crypto
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+re-entropy:
+  extends: .re-entropy
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+re-symbols:
+  extends: .re-symbols
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+re-packer:
+  extends: .re-packer
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+re-shellcode:
+  extends: .re-shellcode
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+re-network:
+  extends: .re-network
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+re-antidebug:
+  extends: .re-antidebug
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    RE_TARGET: "banking-app.jar"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4: FUZZING — LIVE APPLICATION
+# ─────────────────────────────────────────────────────────────────────────────
+# Each fuzz job extends both .start-banking-app (to get a live instance)
+# and the relevant fuzz component. The JAR artifact carries forward from build.
+
+fuzz-http:
+  extends:
+    - .start-banking-app
+    - .fuzz-http
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_THREADS: "5"
+
+fuzz-input:
+  extends:
+    - .start-banking-app
+    - .fuzz-input
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_ENDPOINTS: "/search /login /api/transfer /api/xml/transfer"
+    FUZZ_PARAM: "query"
+    FUZZ_METHOD: "GET"
+
+fuzz-sqli:
+  extends:
+    - .start-banking-app
+    - .fuzz-sqli
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_ENDPOINTS: "/search /login"
+    FUZZ_PARAM: "query"
+    FUZZ_METHOD: "GET"
+    FUZZ_TIMEOUT: "8"
+
+fuzz-xss:
+  extends:
+    - .start-banking-app
+    - .fuzz-xss
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_ENDPOINTS: "/search /profile-search"
+    FUZZ_PARAM: "query"
+    FUZZ_METHOD: "GET"
+
+fuzz-auth:
+  extends:
+    - .start-banking-app
+    - .fuzz-auth
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_LOGIN_PATH: "/login"
+    FUZZ_LOGIN_USER_FIELD: "username"
+    FUZZ_LOGIN_PASS_FIELD: "password"
+    FUZZ_PROTECTED_PATH: "/dashboard"
+
+fuzz-rest:
+  extends:
+    - .start-banking-app
+    - .fuzz-rest
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_URL: "http://localhost:8080"
+    FUZZ_API_PREFIX: "/api"
+
+fuzz-protocol:
+  extends:
+    - .start-banking-app
+    - .fuzz-protocol
+  stage: fuzz
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    FUZZ_TARGET_HOST: "localhost"
+    FUZZ_TARGET_PORTS: "8080"
+
+fuzz-summary:
+  extends: .fuzz-report
+  stage: fuzz
+  needs:
+    - job: fuzz-http
+      artifacts: true
+    - job: fuzz-input
+      artifacts: true
+    - job: fuzz-sqli
+      artifacts: true
+    - job: fuzz-xss
+      artifacts: true
+    - job: fuzz-auth
+      artifacts: true
+    - job: fuzz-rest
+      artifacts: true
+    - job: fuzz-protocol
+      artifacts: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 5: MASTER REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+# Pulls every findings JSON from every previous stage and produces one
+# combined report for DefectDojo import and a readable Markdown summary.
+
+master-report:
+  stage: report
+  image: python:3.12-slim
+  needs:
+    - job: tm-stride
+      artifacts: true
+    - job: tm-dread
+      artifacts: true
+    - job: tm-attack-tree
+      artifacts: true
+    - job: tm-dfd
+      artifacts: true
+    - job: re-strings
+      artifacts: true
+    - job: re-crypto
+      artifacts: true
+    - job: re-entropy
+      artifacts: true
+    - job: re-symbols
+      artifacts: true
+    - job: re-packer
+      artifacts: true
+    - job: re-shellcode
+      artifacts: true
+    - job: re-network
+      artifacts: true
+    - job: re-antidebug
+      artifacts: true
+    - job: fuzz-summary
+      artifacts: true
+  script:
+    - |
+      python3 << 'PYEOF'
+      import json, os, glob, datetime
+
+      SEV_ORDER = ["Critical", "High", "Medium", "Low", "Info"]
+
+      FINDING_FILES = [
+          # Threat modeling
+          "stride-findings.json", "dread-scores.json",
+          "attack-trees.json", "dfd-threats.json",
+          # RE
+          "strings-findings.json", "crypto-findings.json",
+          "entropy-findings.json", "symbols-findings.json",
+          "packer-findings.json", "shellcode-findings.json",
+          "network-findings.json", "antidebug-findings.json",
+          # Fuzzing (combined from fuzz-summary)
+          "fuzz-combined-findings.json",
+      ]
+
+      all_findings = []
+      source_stats = []
+
+      for fname in FINDING_FILES:
+          if os.path.exists(fname):
+              try:
+                  data = json.load(open(fname))
+                  findings = data.get("findings", [])
+                  all_findings.extend(findings)
+                  source_stats.append((fname, len(findings)))
+                  print(f"  {fname}: {len(findings)} findings")
+              except Exception as e:
+                  print(f"  {fname}: parse error — {e}")
+          else:
+              print(f"  {fname}: not found (job may not have run)")
+
+      # Dedup by title
+      seen, deduped = set(), []
+      for f in all_findings:
+          key = f.get("title","")[:120]
+          if key not in seen:
+              seen.add(key)
+              deduped.append(f)
+
+      deduped.sort(key=lambda f: SEV_ORDER.index(f.get("severity","Info")) if f.get("severity") in SEV_ORDER else 99)
+
+      counts = {s: sum(1 for f in deduped if f.get("severity") == s) for s in SEV_ORDER}
+      total = len(deduped)
+
+      json.dump({"findings": deduped}, open("master-findings.json", "w"), indent=2)
+
+      now     = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+      commit  = os.environ.get("CI_COMMIT_SHORT_SHA", "local")
+      project = os.environ.get("CI_PROJECT_PATH", "security-showcase")
+      pipeline= os.environ.get("CI_PIPELINE_ID", "—")
+
+      with open("master-report.md", "w") as f:
+          f.write(f"# Security Assessment — National Bank of Greece\n\n")
+          f.write(f"> **Pipeline:** {pipeline}  |  **Commit:** `{commit}`  |  **Generated:** {now}\n\n")
+          f.write("---\n\n")
+
+          f.write("## Executive Summary\n\n")
+          f.write("| Severity | Count |\n|---|---|\n")
+          for sev in SEV_ORDER:
+              emoji = {"Critical":"🔴","High":"🟠","Medium":"🟡","Low":"🟢","Info":"🔵"}.get(sev,"")
+              f.write(f"| {emoji} {sev} | **{counts[sev]}** |\n")
+          f.write(f"| **Total** | **{total}** |\n\n")
+
+          f.write("## Coverage\n\n")
+          f.write("| Source File | Findings |\n|---|---|\n")
+          for fname, count in source_stats:
+              f.write(f"| `{fname}` | {count} |\n")
+          f.write("\n")
+
+          f.write("## Critical & High Findings\n\n")
+          ch = [fi for fi in deduped if fi.get("severity") in ("Critical","High")]
+          if ch:
+              f.write("| Severity | Finding |\n|---|---|\n")
+              for fi in ch:
+                  f.write(f"| **{fi['severity']}** | {fi.get('title','?')} |\n")
+          else:
+              f.write("_No Critical or High findings._\n")
+          f.write("\n")
+
+          f.write("## All Findings\n\n")
+          f.write("| Severity | Finding |\n|---|---|\n")
+          for fi in deduped:
+              f.write(f"| {fi.get('severity','?')} | {fi.get('title','?')} |\n")
+
+      print(f"\nMaster report: {total} total findings — " +
+            " ".join(f"{s}:{counts[s]}" for s in SEV_ORDER))
+      PYEOF
+
+    - |
+      if [ "${NEXUS_REPORT_UPLOAD}" = "true" ]; then
+        BASE="${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHORT_SHA}/master"
+        for f in master-findings.json master-report.md; do
+          curl -sk -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -T "${f}" "${NEXUS_URL}/repository/${NEXUS_BIN_REPORTS_REPO}/${BASE}/${f}" \
+            -w "Uploaded ${f}: HTTP %{http_code}\n" -o /dev/null
+        done
+      fi
+  artifacts:
+    name: "master-report-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - master-findings.json
+      - master-report.md
+    when: always
+    expire_in: 90 days
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
