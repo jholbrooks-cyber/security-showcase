@@ -155,6 +155,7 @@ tm-stride:
   stage: threat-model
   dependencies: []
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     TM_APP_NAME: "NBG Banking Application"
     TM_DESCRIPTION: >
       Spring Boot web banking app with H2 database. Users can log in, view
@@ -165,20 +166,28 @@ tm-dread:
   extends: .dread-score
   stage: threat-model
   dependencies: []
+  variables:
+    NEXUS_REPORT_UPLOAD: "false"
 
 tm-attack-tree:
   extends: .attack-tree
   stage: threat-model
   dependencies: []
+  variables:
+    NEXUS_REPORT_UPLOAD: "false"
 
 tm-dfd:
   extends: .dfd-threats
   stage: threat-model
   dependencies: []
+  variables:
+    NEXUS_REPORT_UPLOAD: "false"
 
 tm-report:
   extends: .tm-report
   stage: threat-model
+  variables:
+    NEXUS_REPORT_UPLOAD: "false"
   needs:
     - job: tm-stride
       artifacts: true
@@ -200,6 +209,7 @@ re-strings:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
     RE_MIN_STRING_LEN: "8"
 
@@ -210,6 +220,7 @@ re-crypto:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 re-entropy:
@@ -219,6 +230,7 @@ re-entropy:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 re-symbols:
@@ -228,16 +240,18 @@ re-symbols:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 re-packer:
   extends: .re-packer
   stage: analyze
-  timeout: 20 minutes
+  timeout: 40 minutes
   needs:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 re-shellcode:
@@ -247,6 +261,7 @@ re-shellcode:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 re-network:
@@ -256,6 +271,7 @@ re-network:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 re-antidebug:
@@ -265,6 +281,7 @@ re-antidebug:
     - job: build-banking-app
       artifacts: true
   variables:
+    NEXUS_REPORT_UPLOAD: "false"
     RE_TARGET: "banking-app.jar"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,6 +389,8 @@ fuzz-protocol:
 fuzz-summary:
   extends: .fuzz-report
   stage: fuzz
+  variables:
+    NEXUS_REPORT_UPLOAD: "false"
   needs:
     - job: fuzz-http
       artifacts: true
