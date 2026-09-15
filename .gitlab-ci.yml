@@ -79,6 +79,9 @@ include:
   - project: homelab/components/reverse-engineering
     ref: main
     file: re-antidebug.yml
+  - project: homelab/components/reverse-engineering
+    ref: main
+    file: re-yara.yml
   - project: homelab/components/fuzzing
     ref: main
     file: fuzz-http.yml
@@ -274,6 +277,16 @@ re-network:
 
 re-antidebug:
   extends: .re-antidebug
+  stage: analyze
+  needs:
+    - job: build-banking-app
+      artifacts: true
+  variables:
+    NEXUS_REPORT_UPLOAD: "false"
+    RE_TARGET: "banking-app.jar"
+
+re-yara:
+  extends: .re-yara
   stage: analyze
   needs:
     - job: build-banking-app
